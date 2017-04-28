@@ -1,0 +1,763 @@
+---
+title: "Crowdsourcing: `r format(Sys.Date(), format='%B %Y')`"
+output: 
+  flexdashboard::flex_dashboard:
+    theme: lumen
+    orientation: rows
+    source_code: embed
+---
+
+```{r global, include=FALSE}
+### macOS version
+
+# This is a tool to allow for the automation of extracting OSM data, processing it, doing analysis and creating a dashboard to report on the results of predefined questions about the data for two cities. The code is for macOS but there is also a Windows version. This R document will do everything needed. All that is required is to run it with Knit (Rstudio: click on knit). 
+
+# Please take note that this script can take about 2 hours to complete depending on the environment (computer, OS) and teh size of the cities and teh number of buildings.
+
+# This is written in R markdown, a powerful and modern way of generating reports and running analysis and data processing at the same time. Automating reports and analysis is the future! To automate, all that is needed is to use RScript with launchd on a mac or Task scheduler on Windows.
+
+# Look for needed libraries and install them if missing using the pacman package:
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(flexdashboard, tidyverse, ggthemes, lubridate, leaflet,
+               rgdal, forcats, scales, DT, plotly, stringr, rgeos, maptools)
+
+# Capture the date and format for its use
+date <- Sys.Date()
+date2 <- as.character(date)
+date3 <- str_replace_all(date, "-", "")
+
+# Create the path to save files 
+datePath <- file.path("../OSMdata", Sys.Date())
+if(!file.exists(datePath)) dir.create(datePath)
+
+#The URLs to download files
+ontario <- "http://download.geofabrik.de/north-america/canada/ontario-latest.osm.pbf"
+quebec <- "http://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf"
+
+#Create a time stamp and change the file names to include time of download
+FileNameOnt <- "ontario-latest.osm.pbf"
+FileNameOnt <- str_replace_all(FileNameOnt, "latest", date3)
+FileNameQueb <- "quebec-latest.osm.pbf"
+FileNameQueb <- str_replace_all(FileNameQueb, "latest", date3)
+
+#Use created file path, download files and save into the created directory
+OntFile <- file.path(datePath, FileNameOnt)
+QuebFile <- file.path(datePath, FileNameQueb)
+
+download.file(ontario, destfile = OntFile)
+download.file(quebec, destfile = QuebFile)
+
+#Import geometries
+system(paste("cp ~/Projects/OSMdata/Geometries/*.poly", datePath))
+
+# The first part requires system commands line. This was done on a mac. On a PC, system() 
+#must be replaced by shell().
+
+# These commands will run in terminal or a shell and use Osmosis to do three things:
+# a) subset osm data to the CSD of a municipality (Ottawa and Gatineau), subset the buildings (ways), then convert the resulting osm file into a GeoJSON. After processing Ottawa and Gatineau, we merge the two osm files into one OttGat file and turn it into a GeoJSON to have both together.
+
+# 1. Ottawa
+#Here, "\" needs to be escaped to work (with another \)    
+system(paste("cd", datePath, "&& osmosis \\
+       --rbf", FileNameOnt, "\\
+       --bounding-polygon file=\"Ottawa.poly\" \\
+       completeWays=yes \\
+       --wx ottawa.osm"))
+
+#Same thing, a "\" needs to be escaped with another "\"
+system(paste("cd", datePath, "&& osmosis \\
+       --rx ottawa.osm \\
+       --tf accept-ways 'building=*' \\
+       --tf reject-relations \\
+       --used-node \\
+       --wx OttBuildW.osm"))
+
+
+system(paste("cd", datePath, 
+       "&& node --max_old_space_size=8192 `which osmtogeojson` OttBuildW.osm > OttBuildW.geojson"))
+
+# 2. Gatineau
+#Here, "\" needs to be escaped to work (with a \)    
+system(paste("cd", datePath, "&& osmosis \\
+       --rbf", FileNameQueb, "\\
+       --bounding-polygon file=\"Gatineau.poly\" \\
+       completeWays=yes \\
+       --wx gatineau.osm"))
+
+system(paste("cd", datePath, "&& osmosis \\
+       --rx gatineau.osm \\
+       --tf accept-ways 'building=*' \\
+       --tf reject-relations \\
+       --used-node \\
+       --wx GatBuildW.osm"))
+
+system(paste("cd", datePath, 
+       "&& node --max_old_space_size=8192 `which osmtogeojson` GatBuildW.osm > GatBuildW.geojson"))
+
+# The processing is finished and we need to import the GeoJSON to do produce the estimates
+#Build the path from date
+OttJSON <- file.path(datePath, "OttBuildW.geojson")
+GatJSON <- file.path(datePath, "GatBuildW.geojson")
+
+#Import GeoJSON
+BuildOtt <- readOGR(OttJSON, "OGRGeoJSON", require_geomType="wkbPolygon")
+BuildGat <- readOGR(GatJSON, "OGRGeoJSON", require_geomType="wkbPolygon")
+
+#Extract data frame from spatial object
+OttData <-BuildOtt@data
+GatData <- BuildGat@data
+OttGatData <- full_join(OttData, GatData)
+
+OttData$timestamp <- as_date(ymd_hms(OttData$timestamp))
+GatData$timestamp <- as_date(ymd_hms(GatData$timestamp))
+OttGatData$timestamp <- as_date(ymd_hms(OttGatData$timestamp))
+
+# 1. Get number of buildings
+OttNumBuild <- tally(OttData) %>% 
+  mutate(buildings = n) %>% 
+  select(-n) %>% 
+  unlist(use.names = FALSE)
+
+GatNumBuild <- tally(GatData) %>% 
+  mutate(buildings = n) %>% 
+  select(-n) %>% 
+  unlist(use.names = FALSE)
+
+OttGatNumBuild <- tally(OttGatData) %>% 
+  mutate(buildings = n) %>% 
+  select(-n) %>% 
+  unlist(use.names = FALSE)
+
+# 2. Get Month
+month <- Sys.Date()
+
+# 3. Get num of users
+OttUsersBuild <- OttData %>% 
+  summarise(users = n_distinct(user)) %>% 
+  unlist(use.names = FALSE)
+
+GatUsersBuild <- GatData %>% 
+  summarise(users = n_distinct(user)) %>% 
+  unlist(use.names = FALSE)
+
+OttGatUsersBuild <- OttGatData %>% 
+  summarise(users = n_distinct(user)) %>% 
+  unlist(use.names = FALSE)
+
+# 4. calculate number of tags by removing common attributes, sum only non-NAs, sum the rows.
+
+#remove columns with no values before counting tags
+OttData2 <-  OttData %>% 
+  select_if(colSums(!is.na(.)) > 0)
+
+GatData2 <-  GatData %>% 
+  select_if(colSums(!is.na(.)) > 0)
+
+OttGatData2 <-  OttGatData %>% 
+  select_if(colSums(!is.na(.)) > 0)
+
+rownames(OttData2) <- c()
+rownames(GatData2) <- c()
+rownames(OttGatData2) <- c()
+
+#Remove common attributes before counting tags
+CommAttr <- c("id", "user", "uid", "timestamp", "version", "changeset")
+
+OttTagBuild <- OttData2 %>%
+  select(-one_of(CommAttr)) %>% 
+  summarise_each(funs(sum(!is.na(.)))) %>% 
+  mutate(tagsBuild = rowSums(.)) %>% 
+  select(tagsBuild) %>% 
+  unlist(use.names = FALSE)
+
+GatTagBuild <- GatData2 %>%
+  select(-one_of(CommAttr)) %>% 
+  summarise_each(funs(sum(!is.na(.)))) %>% 
+  mutate(tagsBuild = rowSums(.)) %>% 
+  select(tagsBuild) %>% 
+  unlist(use.names = FALSE)
+
+OttGatTagBuild <- OttGatData2 %>%
+  select(-one_of(CommAttr)) %>% 
+  summarise_each(funs(sum(!is.na(.)))) %>% 
+  mutate(tagsBuild = rowSums(.)) %>% 
+  select(tagsBuild) %>% 
+  unlist(use.names = FALSE)
+
+# 5. average tags per building
+OttAvgTagBuild <- OttTagBuild / OttNumBuild
+GatAvgTagBuild <- GatTagBuild / GatNumBuild
+OttGatAvgTagBuild <- OttGatTagBuild / OttGatNumBuild
+
+# Make data frame from the objects
+cities <- c("Ottawa", "Gatineau", "Ott/Gat")
+month <- c(date, date, date)
+buildings <- c(OttNumBuild, GatNumBuild, OttGatNumBuild)
+usersBuild <- c(OttUsersBuild, GatUsersBuild, OttGatUsersBuild)
+tagsBuild <- c(OttTagBuild, GatTagBuild, OttGatTagBuild)
+averTagsBuild <- c(OttAvgTagBuild, GatAvgTagBuild, OttGatAvgTagBuild) 
+
+
+Build <- data.frame(cities, month, buildings, usersBuild, tagsBuild, averTagsBuild)
+
+# Import the existing table containing previous months estimates and format date variable as date
+data <- read.csv('~/Projects/Jarcid/Buildings.csv', header = TRUE)
+data$month <- ymd(data$month)
+
+# Join the existing table with new data from the new estimates
+Build <- full_join(Build, data)
+Build <- arrange(Build, month)
+
+#Save the new table containing new data
+write.csv(Build, '~/Projects/Jarcid/Buildings.csv', row.names = F)
+
+#Create a name with time for the map
+MapName <- "timeStamp.jpg"
+MapDate <- str_replace_all(MapName, "timeStamp", date2)
+
+#Create a theme (styling) for the map: basically, removing any background element and setting background
+#to color #333333
+
+theme1 <- theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank(),
+                axis.title.x = element_blank(), 
+                axis.title.y = element_blank(),
+                axis.text.x = element_blank(), 
+                axis.text.y = element_blank(),
+                axis.ticks = element_blank(),
+                panel.background = element_rect(fill = "#333333"))
+
+
+#Create a map from the building polygons and save it as jpeg image
+jpeg(MapDate, width=1920, height=1166)
+  gg <- ggplot() + 
+    geom_polygon(data = BuildOtt, aes(x = long, y = lat, group = group), fill=NA, color="white") + 
+    geom_polygon(data = BuildGat, aes(x = long, y = lat, group = group), fill=NA, color="white") +
+    theme1 +
+    annotate("text", label = date, x = -76.2, y = 45.05, 
+             size = 14, colour = "white")
+print(gg)
+dev.off()
+
+#Import the table again and process it to fill the needed estimates for the dashboard
+#The different versions of the table are used for different date formating. 
+data <- read.csv('~/Projects/Jarcid/Buildings.csv', header = TRUE)
+data2 <- data
+data3 <- data
+data$averTagsBuild <- round(data$averTagsBuild, 2)
+data2$averTagsBuild <- round(data2$averTagsBuild, 2)
+data$month <- month(data$month, label = TRUE)
+data2$month <- ymd(data2$month)
+
+#The extraction, processing and analysis are almost all done. What follows is the dashboard. 
+#Some calculations and estimates are also done below for each segments.
+
+#Notes: all charts are created with ggplot2. The use of plotly (ggplotly) is only there to benefit from teh autoresizing of ggplotly. This ensures that the plots are always the right size for the space they are given. The code will also make use of the captured date of the extraction where necessary.
+
+```
+
+
+Ottawa {data-navmenu="Cities"}
+=======================================================================
+row
+-----------------------------------------------------------------------
+
+###Buildings {.value-box}
+```{r, echo=FALSE}
+#Count the number of buildings for Ottawa and select the last entry in "month"
+buildOtt <- data2 %>%
+  filter(cities == "Ottawa") %>%
+  top_n(1, month) %>%
+  select(buildings)
+
+valueBox(comma(buildOtt), icon = "ion-ios-home-outline", color = "#9ecae1")
+```
+
+###Users {.value-box}
+```{r}
+#Count the number of users for Ottawa and select the last entry in "month"
+usersOtt <- data2 %>%
+  filter(cities == "Ottawa") %>%
+  top_n(1, month) %>%
+  select(usersBuild)
+
+valueBox(usersOtt, icon = "ion-ios-people-outline", color = "#9ecae1")
+```
+
+###Average number of tags {.value-box}
+```{r}
+#Get the average number of tags for Ottawa and select the last entry in "month"
+tagsOtt <- data2 %>%
+  filter(cities == "Ottawa") %>%
+  top_n(1, month) %>%
+  select(averTagsBuild)
+
+tagsOtt$averTagsBuild <- round(tagsOtt$averTagsBuild, 2)
+
+valueBox(tagsOtt, icon = "ion-ios-pricetags-outline", color = "#9ecae1")
+```
+
+
+row {data-height=400}
+-----------------------------------------------------------------------
+
+###Buildings mapped
+
+```{r, echo=FALSE, message=FALSE}
+#Select buildings for ottawa for all months
+ OttBuild <- data2 %>%
+   filter(cities=="Ottawa") %>%
+   select(cities, month, buildings) %>%
+   group_by(cities, m = month(month)) %>% 
+   filter(month == max(month))
+
+OttBuild$MonthY <- format(as.Date(OttBuild$month), "%b %Y")
+OttBuild$MonthY <- factor(OttBuild$MonthY, levels = OttBuild$MonthY[order(OttBuild$buildings)])
+
+
+#Create a time series line chart
+#With a geom_line plot, you need to add group = 1 if only one group of observations
+#to avoid the warning message each is obs is one group
+gg <- ggplot(OttBuild, aes(MonthY, buildings, group = 1, text = comma(buildings)))
+gg <- gg + geom_line(position = "identity", color="#6baed6")
+gg <- gg + scale_y_continuous(labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major.x= element_blank())
+gg <- gg + theme(panel.grid.major.y=element_line(linetype = "dashed"))
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks=element_line(colour="#ececec"))
+gg <- gg + theme(axis.text.x=element_text(size=12))
+gg <- gg + theme(axis.text.y=element_text(size=10))
+ggplotly(gg, tooltip = "text")
+```
+
+row {data-height=600}
+-------------------------------------------------------------------
+###Buildings by type 
+```{r}
+#Select buildings for Ottawa and group them by type, calculate sum by type and sort in descending order, 
+#then select those with over 50 buildings per type
+buildType <- OttData2 %>% 
+  group_by(building) %>%
+  summarise(numB = length(building)) %>%
+  arrange(desc(numB)) %>%
+  filter(numB > 50)
+
+#Create a dot plot
+gg <- ggplot(buildType, aes(x=numB, y=reorder(building, numB), text = comma(numB)))
+gg <- gg + geom_segment(aes(xend = 0, yend=building), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=9))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+### Missing address fields in percentage
+```{r}
+# Select the variables to study (attributes)
+MissAddOtt <- OttData2 %>%
+  select(addr.street, addr.housenumber, addr.city, addr.postcode)
+
+#Change the variable names to descriptive names, sum and calculate the percentage of missing
+MeanAddrOtt <- MissAddOtt %>%
+  summarise_all(funs(mean(is.na(.))*100)) %>%
+  gather(Field, meanNA) %>%
+  mutate(Field = fct_recode(Field, "Street" = "addr.street", 
+                            "Street Number" = "addr.housenumber",
+                            "City" = "addr.city",
+                            "Postal Code" = "addr.postcode"))
+
+gg <- ggplot(MeanAddrOtt, aes(x=reorder(Field, meanNA), y=meanNA, text = round(meanNA, 2)))
+gg <- gg + geom_segment(aes(xend = Field, yend=0), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + coord_flip()
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+
+###Number of tags
+```{r}
+#Select tags per building for Ottawa, change the date of August 1 to August 30th to plot a monthly series. This would be controversial in a stastical analysis but we are simply plotting the data we already have on a monthly basis. The date of extraction in August does not matter as it was just a starting point to collect data. Changing it to 30th is just more convenient for the plot and does not affect the data.
+OttTagsBuild <- data2 %>% 
+  filter(cities=="Ottawa") %>%
+  select(cities, month, tagsBuild) %>%
+  mutate(month = ymd(month)) %>%
+  group_by(cities, m = month(month)) %>% 
+  filter(month == max(month))
+
+OttTagsBuild$MonthY <- format(as.Date(OttTagsBuild$month), "%b %Y")
+OttTagsBuild$MonthY <- factor(OttTagsBuild$MonthY, levels = OttTagsBuild$MonthY[order(OttTagsBuild$tagsBuild)])
+
+gg <- ggplot(OttTagsBuild, aes(x=tagsBuild, y=MonthY, text = comma(tagsBuild)))
+gg <- gg + geom_segment(aes(xend = 0, yend=MonthY), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+Gatineau {data-navmenu="Cities"}
+=======================================================================
+row
+-----------------------------------------------------------------------
+
+###Buildings {.value-box}
+```{r, echo=FALSE}
+buildGat <- data2 %>%
+  filter(cities == "Gatineau") %>%
+  top_n(1, month) %>%
+  select(buildings)
+
+valueBox(comma(buildGat), icon = "ion-ios-home-outline", color = "#9ecae1")
+```
+
+###Users {.value-box}
+```{r}
+usersGat <- data2 %>%
+  filter(cities == "Gatineau") %>%
+  top_n(1, month) %>%
+  select(usersBuild)
+
+valueBox(usersGat, icon = "ion-ios-people-outline", color = "#9ecae1")
+```
+
+###Average number of tags {.value-box}
+```{r}
+tagsGat <- data2 %>%
+  filter(cities == "Gatineau") %>%
+  top_n(1, month) %>%
+  select(averTagsBuild)
+
+tagsGat$averTagsBuild <- round(tagsGat$averTagsBuild, 2)
+
+valueBox(tagsGat, icon = "ion-ios-pricetags-outline", color = "#9ecae1")
+```
+
+
+row {data-height=400}
+-----------------------------------------------------------------------
+
+###Buildings mapped
+```{r, echo=FALSE, message=FALSE}
+ GatBuild <- data2 %>%
+   filter(cities=="Gatineau") %>%
+   select(cities, month, buildings) %>%
+   group_by(cities, m = month(month)) %>% 
+   filter(month == max(month))
+
+GatBuild$MonthY <- format(as.Date(GatBuild$month), "%b %Y")
+GatBuild$MonthY <- factor(GatBuild$MonthY, levels = GatBuild$MonthY[order(GatBuild$buildings)])
+
+#Create a time series line chart
+#With a geom_line plot, you need to add group = 1 if only one group of observations
+#to avoid the warning message each is obs is one group
+gg <- ggplot(GatBuild, aes(MonthY, buildings, group = 1, text = comma(buildings)))
+gg <- gg + geom_line(position = "identity", color="#6baed6")
+gg <- gg + scale_y_continuous(labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major.x= element_blank())
+gg <- gg + theme(panel.grid.major.y=element_line(linetype = "dashed"))
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks=element_line(colour="#ececec"))
+gg <- gg + theme(axis.text.x=element_text(size=12))
+gg <- gg + theme(axis.text.y=element_text(size=10))
+ggplotly(gg, tooltip = "text")
+```
+
+row {data-height=600}
+-------------------------------------------------------------------
+###Buildings by type
+```{r}
+buildTypeGat <- GatData2 %>% 
+  group_by(building) %>%
+  summarise(numB = length(building)) %>%
+  arrange(desc(numB)) %>%
+  filter(numB > 50)
+
+gg <- ggplot(buildTypeGat, aes(x=numB, y=reorder(building, numB), text = comma(numB)))
+gg <- gg + geom_segment(aes(xend = 0, yend=building), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=9))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+### Missing address fields in percentage
+```{r}
+
+MissAddGat <- GatData2 %>%
+  select(addr.street, addr.housenumber, addr.city, addr.postcode)
+
+
+MeanAddrGat <- MissAddGat %>%
+  summarise_all(funs(mean(is.na(.))*100)) %>%
+  gather(Field, meanNA) %>%
+  mutate(Field = fct_recode(Field, "Street" = "addr.street", 
+                            "Street Number" = "addr.housenumber",
+                            "City" = "addr.city",
+                            "Postal Code" = "addr.postcode"))
+
+gg <- ggplot(MeanAddrGat, aes(x=reorder(Field, meanNA), y=meanNA, text = round(meanNA, 2)))
+gg <- gg + geom_segment(aes(xend = Field, yend=0), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + coord_flip()
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+###Number of tags
+
+```{r}
+GatTagsBuild <- data2 %>% 
+  filter(cities=="Gatineau") %>%
+  select(cities, month, tagsBuild) %>%
+  mutate(month = ymd(month)) %>%
+  group_by(cities, m = month(month)) %>% 
+  filter(month == max(month))
+
+GatTagsBuild$MonthY <- format(as.Date(GatTagsBuild$month), "%b %Y")
+GatTagsBuild$MonthY <- factor(GatTagsBuild$MonthY, levels = GatTagsBuild$MonthY[order(GatTagsBuild$tagsBuild)])
+
+gg <- ggplot(GatTagsBuild, aes(x=tagsBuild, y=MonthY, text = comma(tagsBuild)))
+gg <- gg + geom_segment(aes(xend = 0, yend=MonthY), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+Ottawa-Gatineau {data-navmenu="Cities"}
+=======================================================================
+row
+-----------------------------------------------------------------------
+
+###Buildings {.value-box}
+```{r, echo=FALSE}
+buildOttGat <- data2 %>%
+  filter(cities == "Ott/Gat") %>%
+  top_n(1, month) %>%
+  select(buildings)
+
+valueBox(comma(buildOttGat), icon = "ion-ios-home-outline", color = "#9ecae1")
+```
+
+###Users {.value-box}
+```{r}
+usersOttGat <- data2 %>%
+  filter(cities == "Ott/Gat") %>%
+  top_n(1, month) %>%
+  select(usersBuild)
+
+valueBox(usersOttGat, icon = "ion-ios-people-outline", color = "#9ecae1")
+```
+
+###Average number of tags {.value-box}
+```{r}
+tagsOttGat <- data2 %>%
+  filter(cities == "Ott/Gat") %>%
+  top_n(1, month) %>%
+  select(averTagsBuild)
+
+tagsOttGat$averTagsBuild <- round(tagsOttGat$averTagsBuild, 2)
+
+valueBox(tagsOttGat, icon = "ion-ios-pricetags-outline", color = "#9ecae1")
+```
+
+
+row {data-height=400}
+-----------------------------------------------------------------------
+
+###Buildings mapped
+
+```{r, echo=FALSE, message=FALSE}
+ OttBuildGat <- data2 %>%
+   filter(cities=="Ott/Gat") %>%
+   select(cities, month, buildings) %>%
+   group_by(cities, m = month(month)) %>% 
+   filter(month == max(month))
+
+OttBuildGat$MonthY <- format(as.Date(OttBuildGat$month), "%b %Y")
+OttBuildGat$MonthY <- factor(OttBuildGat$MonthY, levels = OttBuildGat$MonthY[order(OttBuildGat$buildings)])
+
+#Create a time series line chart
+#With a geom_line plot, you need to add group = 1 if only one group of observations
+#to avoid the warning message each is obs is one group
+gg <- ggplot(OttBuildGat, aes(MonthY, buildings, group = 1, text = comma(buildings)))
+gg <- gg + geom_line(position = "identity", color="#6baed6")
+gg <- gg + scale_y_continuous(labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major.x= element_blank())
+gg <- gg + theme(panel.grid.major.y=element_line(linetype = "dashed"))
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks=element_line(colour="#ececec"))
+gg <- gg + theme(axis.text.x=element_text(size=12))
+gg <- gg + theme(axis.text.y=element_text(size=10))
+ggplotly(gg, tooltip = "text")
+```
+
+row {data-height=600}
+-------------------------------------------------------------------
+###Buildings by type
+```{r}
+buildTypeOttGat <- OttGatData2 %>% 
+  group_by(building) %>%
+  summarise(numB = length(building)) %>%
+  arrange(desc(numB)) %>%
+  filter(numB > 50)
+
+gg <- ggplot(buildTypeOttGat, aes(x=numB, y=reorder(building, numB), text = comma(numB)))
+gg <- gg + geom_segment(aes(xend = 0, yend=building), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=9))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+### Missing address fields in percentage
+```{r}
+
+MissAddOttGat <- OttGatData2 %>%
+  select(addr.street, addr.housenumber, addr.city, addr.postcode)
+
+MeanAddrOttGat <- MissAddOttGat %>%
+  summarise_all(funs(mean(is.na(.))*100)) %>%
+  gather(Field, meanNA) %>%
+  mutate(Field = fct_recode(Field, "Street" = "addr.street", 
+                            "Street Number" = "addr.housenumber",
+                            "City" = "addr.city",
+                            "Postal Code" = "addr.postcode"))
+
+gg <- ggplot(MeanAddrOttGat, aes(x=reorder(Field, meanNA), y=meanNA, text = round(meanNA, 2)))
+gg <- gg + geom_segment(aes(xend = Field, yend=0), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + coord_flip()
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+###Number of tags
+
+```{r}
+OttGatTagsBuild <- data2 %>% 
+  filter(cities=="Ott/Gat") %>%
+  select(cities, month, tagsBuild) %>%
+  mutate(month = ymd(month)) %>%
+  group_by(cities, m = month(month)) %>% 
+  filter(month == max(month))
+
+OttGatTagsBuild$MonthY <- format(as.Date(OttGatTagsBuild$month), "%b %Y")
+OttGatTagsBuild$MonthY <- factor(OttGatTagsBuild$MonthY, levels = OttGatTagsBuild$MonthY[order(OttGatTagsBuild$tagsBuild)])
+
+gg <- ggplot(OttGatTagsBuild, aes(x=tagsBuild, y=MonthY, text = comma(tagsBuild)))
+gg <- gg + geom_segment(aes(xend = 0, yend=MonthY), color="#ececec")
+gg <- gg + geom_point(color = "#3282bd", size = 2)
+gg <- gg + scale_x_continuous(expand = c(0.1,0), labels = comma)
+gg <- gg + labs(x = NULL, y = NULL)
+gg <- gg + theme(strip.background=element_blank())
+gg <- gg + theme_bw(base_family = "Helvetica")
+gg <- gg + theme(panel.border = element_blank())
+gg <- gg + theme(panel.grid.major = element_blank())
+gg <- gg + theme(panel.grid.minor = element_blank())
+gg <- gg + theme(axis.ticks.y=element_blank())
+gg <- gg + theme(axis.text.x=element_text(size=10))
+gg <- gg + theme(axis.text.y=element_text(size=12))
+ggplotly(gg, tooltip = "text")
+```
+
+
+Data
+========================================================
+```{r}
+#Builds an interactive table using DataTable
+datatable(data2, extensions = "Buttons", 
+          options = list(dom="lfrtBip", buttons="csv"))
+```
+
+
+August 2016 {data-navmenu="Maps"}
+========================================================
+```{r, out.width = "1024px"}
+#Import the map for August
+knitr::include_graphics("Aug2016.jpg")
+```
+
+`r format(date, format='%B %Y')` {data-navmenu="Maps"}
+========================================================
+```{r, out.width = "1024px"}
+#Import the map created earlier for the current extraction date
+knitr::include_graphics(MapDate)
+```
